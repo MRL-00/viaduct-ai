@@ -1,0 +1,111 @@
+server:
+  host: 0.0.0.0
+  port: 8080
+
+storage:
+  path: ./viaduct.db
+
+llm:
+  default_provider: anthropic
+  providers:
+    anthropic:
+      api_key: ${ANTHROPIC_API_KEY}
+      default_model: claude-sonnet-4-5-20250514
+      base_url: ""
+    openai:
+      api_key: ${OPENAI_API_KEY}
+      default_model: gpt-4o
+      base_url: ""
+    # OpenAI-compatible custom gateway with OAuth client-credentials auth only.
+    custom:
+      auth_type: oauth
+      base_url: https://llm-gateway.example.com/v1
+      default_model: my-org-model
+      oauth:
+        token_url: https://auth.example.com/oauth2/token
+        client_id: ${MODEL_OAUTH_CLIENT_ID}
+        client_secret: ${MODEL_OAUTH_CLIENT_SECRET}
+        scopes: [ai.inference]
+
+  routing:
+    strategy: task_based
+    classification: openai/gpt-4o-mini
+    summarisation: anthropic/claude-sonnet-4-5-20250514
+    analysis: anthropic/claude-sonnet-4-5-20250514
+    generation: anthropic/claude-sonnet-4-5-20250514
+    code: anthropic/claude-sonnet-4-5-20250514
+    default: anthropic/claude-sonnet-4-5-20250514
+    chain:
+      - anthropic/claude-sonnet-4-5-20250514
+      - openai/gpt-4o
+    escalation_chain:
+      - openai/gpt-4o-mini
+      - anthropic/claude-sonnet-4-5-20250514
+    retry:
+      max_attempts: 3
+      backoff: exponential
+    tasks: {}
+
+  pricing:
+    anthropic/claude-sonnet-4-5-20250514:
+      input_per_million: 3.0
+      output_per_million: 15.0
+    openai/gpt-4o-mini:
+      input_per_million: 0.15
+      output_per_million: 0.60
+
+  rate_limits:
+    anthropic:
+      requests_per_minute: 50
+      tokens_per_minute: 100000
+    openai:
+      requests_per_minute: 60
+      tokens_per_minute: 150000
+
+connectors:
+  microsoft365:
+    tenant_id: ${AZURE_TENANT_ID}
+    client_id: ${AZURE_CLIENT_ID}
+    client_secret: ${AZURE_CLIENT_SECRET}
+    permissions: [read]
+  azure:
+    tenant_id: ${AZURE_TENANT_ID}
+    client_id: ${AZURE_CLIENT_ID}
+    client_secret: ${AZURE_CLIENT_SECRET}
+    subscription_id: ${AZURE_SUBSCRIPTION_ID}
+    permissions: [read]
+  slack:
+    bot_token: ${SLACK_BOT_TOKEN}
+    app_token: ${SLACK_APP_TOKEN}
+    permissions: [read, write]
+
+scheduler:
+  timezone: Pacific/Auckland
+
+jobs:
+  - name: morning-briefing
+    cron: "0 8 * * 1-5"
+    timezone: Pacific/Auckland
+    task: |
+      Summarise overnight Azure Monitor alerts and post to #ops in Slack.
+    connectors: [azure, slack]
+    permissions:
+      azure: read
+      slack: write
+    cost_limit_usd: 0.50
+    on_failure: notify
+    enabled: true
+    timeout: 5m
+    allow_overlap: false
+    run_on_startup_if_missed: false
+
+security:
+  audit:
+    retention_days: 90
+    export:
+      enabled: false
+      destination: file
+  llm_data_policy:
+    restricted_connectors:
+      - microsoft365
+    restricted_mode: summarise_first

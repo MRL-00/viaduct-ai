@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -60,15 +61,7 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req CompletionRequest) (C
 		})
 	}
 
-	chatReq := openai.ChatCompletionRequest{
-		Model:       model,
-		Messages:    messages,
-		Tools:       tools,
-		Temperature: float32(req.Temperature),
-	}
-	if req.MaxTokens > 0 {
-		chatReq.MaxTokens = req.MaxTokens
-	}
+	chatReq := buildOpenAIChatRequest(model, messages, tools, req, false)
 
 	resp, err := p.client.CreateChatCompletion(ctx, chatReq)
 	if err != nil {
@@ -132,16 +125,7 @@ func (p *OpenAIProvider) CompleteStream(ctx context.Context, req CompletionReque
 		})
 	}
 
-	chatReq := openai.ChatCompletionRequest{
-		Model:       model,
-		Messages:    messages,
-		Tools:       tools,
-		Stream:      true,
-		Temperature: float32(req.Temperature),
-	}
-	if req.MaxTokens > 0 {
-		chatReq.MaxTokens = req.MaxTokens
-	}
+	chatReq := buildOpenAIChatRequest(model, messages, tools, req, true)
 
 	stream, err := p.client.CreateChatCompletionStream(ctx, chatReq)
 	if err != nil {
@@ -170,6 +154,45 @@ func (p *OpenAIProvider) CompleteStream(ctx context.Context, req CompletionReque
 		}
 	}()
 	return ch, nil
+}
+
+func buildOpenAIChatRequest(
+	model string,
+	messages []openai.ChatCompletionMessage,
+	tools []openai.Tool,
+	req CompletionRequest,
+	stream bool,
+) openai.ChatCompletionRequest {
+	chatReq := openai.ChatCompletionRequest{
+		Model:    model,
+		Messages: messages,
+		Tools:    tools,
+		Stream:   stream,
+	}
+
+	if isReasoningModel(model) {
+		if req.MaxTokens > 0 {
+			chatReq.MaxCompletionTokens = req.MaxTokens
+		}
+		if req.Temperature == 1 {
+			chatReq.Temperature = 1
+		}
+		return chatReq
+	}
+
+	if req.MaxTokens > 0 {
+		chatReq.MaxTokens = req.MaxTokens
+	}
+	chatReq.Temperature = float32(req.Temperature)
+	return chatReq
+}
+
+func isReasoningModel(model string) bool {
+	model = strings.TrimSpace(strings.ToLower(model))
+	return strings.HasPrefix(model, "o1") ||
+		strings.HasPrefix(model, "o3") ||
+		strings.HasPrefix(model, "o4") ||
+		strings.HasPrefix(model, "gpt-5")
 }
 
 var _ Provider = (*OpenAIProvider)(nil)

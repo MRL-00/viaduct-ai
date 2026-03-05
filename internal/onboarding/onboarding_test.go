@@ -1,4 +1,4 @@
-package main
+package onboarding
 
 import (
 	"os"
@@ -98,15 +98,6 @@ connectors: {}
 	}
 }
 
-func TestConnectorConfigReadySlack(t *testing.T) {
-	if ok, _ := connectorConfigReady("slack", map[string]any{}); ok {
-		t.Fatalf("expected slack connector to be not ready without bot_token")
-	}
-	if ok, _ := connectorConfigReady("slack", map[string]any{"bot_token": "xoxb-123"}); !ok {
-		t.Fatalf("expected slack connector to be ready with bot_token")
-	}
-}
-
 func TestSlackOnboardingPromptState(t *testing.T) {
 	t.Run("missing slack connector prompts", func(t *testing.T) {
 		dir := t.TempDir()
@@ -167,4 +158,106 @@ func TestSlackOnboardingPromptState(t *testing.T) {
 			t.Fatalf("expected no prompt for complete setup")
 		}
 	})
+}
+
+func TestLLMOnboardingPromptState(t *testing.T) {
+	t.Run("missing llm prompts", func(t *testing.T) {
+		dir := t.TempDir()
+		cfgPath := filepath.Join(dir, "viaduct.yaml")
+		if err := os.WriteFile(cfgPath, []byte("connectors: {}\n"), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		needs, msg, err := llmOnboardingPromptState(cfgPath)
+		if err != nil {
+			t.Fatalf("llmOnboardingPromptState() error = %v", err)
+		}
+		if !needs {
+			t.Fatalf("expected prompt for missing llm config")
+		}
+		if !strings.Contains(strings.ToLower(msg), "llm") {
+			t.Fatalf("expected llm message, got %q", msg)
+		}
+	})
+
+	t.Run("missing refresh token prompts", func(t *testing.T) {
+		dir := t.TempDir()
+		cfgPath := filepath.Join(dir, "viaduct.yaml")
+		content := `llm:
+  default_provider: openai
+  providers:
+    openai:
+      auth_type: oauth
+      base_url: "https://api.openai.com/v1"
+      default_model: "gpt-5.3-codex"
+      oauth:
+        mode: authorization_code
+        token_url: "https://auth.openai.com/oauth/token"
+        client_id: "app-test"
+`
+		if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		needs, msg, err := llmOnboardingPromptState(cfgPath)
+		if err != nil {
+			t.Fatalf("llmOnboardingPromptState() error = %v", err)
+		}
+		if !needs {
+			t.Fatalf("expected prompt for missing oauth refresh_token")
+		}
+		if !strings.Contains(strings.ToLower(msg), "refresh_token") {
+			t.Fatalf("expected refresh_token message, got %q", msg)
+		}
+	})
+
+	t.Run("complete llm setup does not prompt", func(t *testing.T) {
+		dir := t.TempDir()
+		cfgPath := filepath.Join(dir, "viaduct.yaml")
+		content := `llm:
+  default_provider: openai
+  providers:
+    openai:
+      auth_type: oauth
+      base_url: "https://api.openai.com/v1"
+      default_model: "gpt-5.3-codex"
+      oauth:
+        mode: authorization_code
+        token_url: "https://auth.openai.com/oauth/token"
+        client_id: "app-test"
+        refresh_token: "rt_123"
+  routing:
+    default: openai/gpt-5.3-codex
+    analysis: openai/gpt-5.3-codex
+    generation: openai/gpt-5.3-codex
+    classification: openai/gpt-5.3-codex
+`
+		if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		needs, _, err := llmOnboardingPromptState(cfgPath)
+		if err != nil {
+			t.Fatalf("llmOnboardingPromptState() error = %v", err)
+		}
+		if needs {
+			t.Fatalf("expected no prompt for complete llm setup")
+		}
+	})
+}
+
+func TestSlackSetupInstructions(t *testing.T) {
+	out := SlackSetupInstructions()
+	for _, want := range []string{
+		"xoxb-",
+		"OAuth & Permissions",
+		"xapp-",
+		"connections:write",
+		"Socket Mode",
+		"app_mention",
+		"commands",
+		"Request URL",
+		"invite it to the default channel",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected setup instructions to mention %q, got:\n%s", want, out)
+		}
+	}
 }

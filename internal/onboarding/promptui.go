@@ -1,4 +1,4 @@
-package main
+package onboarding
 
 import (
 	"fmt"
@@ -21,7 +21,7 @@ func promptSelect(title string, options []menuOption, defaultIndex int) (int, bo
 	items := make([]string, 0, len(options))
 	for _, option := range options {
 		if option.Description != "" {
-			items = append(items, fmt.Sprintf("%s — %s", option.Label, option.Description))
+			items = append(items, fmt.Sprintf("%s - %s", option.Label, option.Description))
 		} else {
 			items = append(items, option.Label)
 		}

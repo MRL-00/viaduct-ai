@@ -11,7 +11,7 @@ This repository implements a Phase 1 foundation:
 - Connectors: Microsoft 365 (read), Azure (read), Slack (read/write/listen)
 - LLM router + Anthropic/OpenAI providers
 - Agent orchestration loop with tool calls
-- Inbound chat bridge for messenger connectors (Slack app mentions and slash commands)
+- Inbound chat bridge for messenger connectors (Slack app mentions, direct messages, and slash commands)
 - CRON scheduler (`robfig/cron/v3`)
 - Audit + LLM usage logging
 - Cobra CLI
@@ -91,6 +91,27 @@ viaduct setup init --config ./viaduct.yaml
 viaduct setup init --advanced --config ./viaduct.yaml
 viaduct setup slack --config ./viaduct.yaml
 ```
+
+## Slack App Setup
+
+When onboarding asks for Slack tokens:
+
+- Bot token: in your Slack app dashboard under `OAuth & Permissions` -> `Bot User OAuth Token`. This value starts with `xoxb-`.
+- App token: in `Settings` -> `Basic Information` -> `App-Level Tokens`. Create one with the `connections:write` scope. This value starts with `xapp-`.
+
+Recommended Slack app configuration for Viaduct:
+
+- Under `OAuth & Permissions`, add bot scopes `chat:write`, `channels:read`, and `channels:history`.
+- If you want inbound chat when someone mentions the app, also add `app_mentions:read`.
+- If you want users to DM the app from App Home, enable `Messages Tab` in `App Home`, keep `im:history`, and subscribe to `message.im`.
+- If you want follow-up replies in public-channel threads after the first mention, subscribe to `message.channels`.
+- If you want follow-up replies in private-channel threads, add `groups:history` and subscribe to `message.groups`.
+- If you want slash commands, add the `commands` scope and create a command under `Slash Commands`.
+- Under `Settings` -> `Socket Mode`, enable Socket Mode if you want inbound chat. Viaduct uses Socket Mode, so you do not need a Request URL for events or slash commands.
+- Under `Event Subscriptions`, enable events and subscribe to `app_mention`, plus `message.channels` and/or `message.groups` if you want thread follow-ups.
+- Reinstall the app to the workspace after changing scopes, then invite it to the channel you configure as `default_channel` (for example `/invite @your-app`).
+
+If you only want Viaduct to post messages to Slack, the bot token is enough. The app token is only needed for inbound chat features such as app mentions and slash commands.
 
 ## Model Setup
 

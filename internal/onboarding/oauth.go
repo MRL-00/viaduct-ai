@@ -1,4 +1,4 @@
-package main
+package onboarding
 
 import (
 	"bufio"
@@ -54,6 +54,7 @@ type openAICodexOAuthCredentials struct {
 type openAICallbackServer struct {
 	srv    *http.Server
 	codeCh chan string
+	errCh  chan error
 }
 
 func runOpenAICodexOAuthLogin(reader *bufio.Reader) (*openAICodexOAuthCredentials, error) {
@@ -92,16 +93,22 @@ func runOpenAICodexOAuthLogin(reader *bufio.Reader) (*openAICodexOAuthCredential
 		}
 	}
 
-	if strings.TrimSpace(code) == "" {
+	for attempt := 0; strings.TrimSpace(code) == ""; attempt++ {
+		if attempt > 0 {
+			fmt.Println("OAuth callback was not captured. Paste the full redirect URL from the browser address bar, or just the `code` value.")
+		}
 		input := strings.TrimSpace(promptWithDefault(reader, "Paste redirect URL or authorization code", ""))
 		parsedCode, parsedState := parseOpenAIAuthorizationInput(input)
 		if parsedState != "" && parsedState != flow.State {
 			return nil, fmt.Errorf("oauth state mismatch")
 		}
 		code = parsedCode
+		if attempt >= 2 && strings.TrimSpace(code) == "" {
+			break
+		}
 	}
 	if strings.TrimSpace(code) == "" {
-		return nil, fmt.Errorf("missing authorization code")
+		return nil, fmt.Errorf("missing authorization code: paste the full redirect URL or the `code` query parameter")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -110,10 +117,14 @@ func runOpenAICodexOAuthLogin(reader *bufio.Reader) (*openAICodexOAuthCredential
 	if err != nil {
 		return nil, err
 	}
+	scopes := extractOpenAIScopes(creds.AccessToken)
 	if creds.AccountID != "" {
 		fmt.Printf("OpenAI OAuth complete for account %s\n", creds.AccountID)
 	} else {
 		fmt.Println("OpenAI OAuth complete.")
+	}
+	if len(scopes) > 0 {
+		fmt.Printf("OpenAI OAuth scopes: %s\n", strings.Join(scopes, ", "))
 	}
 	return creds, nil
 }
@@ -175,17 +186,40 @@ func randomHex(size int) (string, error) {
 }
 
 func startOpenAICallbackServer(expectedState string) (*openAICallbackServer, error) {
-	s := &openAICallbackServer{codeCh: make(chan string, 1)}
+	s := &openAICallbackServer{
+		codeCh: make(chan string, 1),
+		errCh:  make(chan error, 1),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("state") != expectedState {
-			http.Error(w, "State mismatch", http.StatusBadRequest)
+			err := fmt.Errorf("oauth state mismatch")
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			select {
+			case s.errCh <- err:
+			default:
+			}
+			return
+		}
+		if oauthErr := strings.TrimSpace(r.URL.Query().Get("error")); oauthErr != "" {
+			description := strings.TrimSpace(r.URL.Query().Get("error_description"))
+			err := fmt.Errorf("oauth callback returned error=%s description=%s", oauthErr, description)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			select {
+			case s.errCh <- err:
+			default:
+			}
 			return
 		}
 		code := strings.TrimSpace(r.URL.Query().Get("code"))
 		if code == "" {
-			http.Error(w, "Missing authorization code", http.StatusBadRequest)
+			err := fmt.Errorf("oauth callback missing authorization code")
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			select {
+			case s.errCh <- err:
+			default:
+			}
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -197,15 +231,28 @@ func startOpenAICallbackServer(expectedState string) (*openAICallbackServer, err
 		}
 	})
 
-	ln, err := net.Listen("tcp", "127.0.0.1:1455")
-	if err != nil {
-		return nil, err
-	}
-
 	s.srv = &http.Server{Handler: mux}
-	go func() {
-		_ = s.srv.Serve(ln)
-	}()
+
+	listenAddrs := []string{"127.0.0.1:1455", "[::1]:1455"}
+	started := 0
+	for _, addr := range listenAddrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			continue
+		}
+		started++
+		go func(listener net.Listener) {
+			if err := s.srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				select {
+				case s.errCh <- err:
+				default:
+				}
+			}
+		}(ln)
+	}
+	if started == 0 {
+		return nil, fmt.Errorf("could not bind callback server on 127.0.0.1:1455 or [::1]:1455")
+	}
 	return s, nil
 }
 
@@ -213,6 +260,8 @@ func (s *openAICallbackServer) WaitForCode(ctx context.Context) (string, error) 
 	select {
 	case code := <-s.codeCh:
 		return code, nil
+	case err := <-s.errCh:
+		return "", err
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
@@ -226,105 +275,124 @@ func (s *openAICallbackServer) Close(ctx context.Context) error {
 }
 
 func parseOpenAIAuthorizationInput(input string) (code string, state string) {
-	value := strings.TrimSpace(input)
-	if value == "" {
+	input = strings.TrimSpace(input)
+	if input == "" {
 		return "", ""
 	}
-
-	if parsedURL, err := url.Parse(value); err == nil && parsedURL.Scheme != "" && parsedURL.Host != "" {
-		return parsedURL.Query().Get("code"), parsedURL.Query().Get("state")
-	}
-
-	if strings.Contains(value, "#") {
-		parts := strings.SplitN(value, "#", 2)
-		code = strings.TrimSpace(parts[0])
-		if len(parts) > 1 {
-			state = strings.TrimSpace(parts[1])
+	if strings.Contains(input, "://") {
+		u, err := url.Parse(input)
+		if err != nil {
+			return "", ""
 		}
-		return code, state
+		return strings.TrimSpace(u.Query().Get("code")), strings.TrimSpace(u.Query().Get("state"))
 	}
-
-	if strings.Contains(value, "code=") {
-		params, err := url.ParseQuery(value)
+	if strings.Contains(input, "code=") || strings.Contains(input, "state=") {
+		values, err := url.ParseQuery(input)
 		if err == nil {
-			return params.Get("code"), params.Get("state")
+			return strings.TrimSpace(values.Get("code")), strings.TrimSpace(values.Get("state"))
 		}
 	}
-
-	return value, ""
+	return input, ""
 }
 
 func exchangeOpenAICodexAuthorizationCode(ctx context.Context, code, verifier string) (*openAICodexOAuthCredentials, error) {
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
-	form.Set("client_id", openAICodexClientID)
 	form.Set("code", code)
-	form.Set("code_verifier", verifier)
+	form.Set("client_id", openAICodexClientID)
 	form.Set("redirect_uri", openAICodexRedirectURI)
+	form.Set("code_verifier", verifier)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openAICodexTokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("build oauth token request: %w", err)
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request oauth token: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read oauth token response: %w", err)
+		return nil, err
 	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("oauth token request failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("oauth token exchange failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var payload struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		ExpiresIn    int64  `json:"expires_in"`
+		IDToken      string `json:"id_token"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("decode oauth token response: %w", err)
+		return nil, err
 	}
-	if payload.AccessToken == "" || payload.RefreshToken == "" || payload.ExpiresIn <= 0 {
-		return nil, fmt.Errorf("oauth token response missing required fields")
+	if strings.TrimSpace(payload.AccessToken) == "" {
+		return nil, fmt.Errorf("oauth token response missing access_token")
+	}
+
+	accountID := extractOpenAIAccountID(payload.AccessToken)
+	if accountID == "" {
+		accountID = extractOpenAIAccountID(payload.IDToken)
 	}
 
 	creds := &openAICodexOAuthCredentials{
 		AccessToken:  payload.AccessToken,
 		RefreshToken: payload.RefreshToken,
-		ExpiresAt:    time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second),
-		AccountID:    extractOpenAIAccountID(payload.AccessToken),
+		AccountID:    accountID,
+	}
+	if payload.ExpiresIn > 0 {
+		creds.ExpiresAt = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
 	}
 	return creds, nil
 }
 
-func extractOpenAIAccountID(accessToken string) string {
-	parts := strings.Split(accessToken, ".")
-	if len(parts) != 3 {
+func extractOpenAIAccountID(jwt string) string {
+	claims := decodeJWTPayload(jwt)
+	if len(claims) == 0 {
 		return ""
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if auth, ok := claims[openAICodexJWTClaimPath].(map[string]any); ok {
+		if accountID, ok := auth["chatgpt_account_id"].(string); ok {
+			return strings.TrimSpace(accountID)
+		}
+	}
+	if accountID, ok := claims["chatgpt_account_id"].(string); ok {
+		return strings.TrimSpace(accountID)
+	}
+	return ""
+}
+
+func extractOpenAIScopes(jwt string) []string {
+	claims := decodeJWTPayload(jwt)
+	if len(claims) == 0 {
+		return nil
+	}
+	scopeValue, _ := claims["scope"].(string)
+	if strings.TrimSpace(scopeValue) == "" {
+		return nil
+	}
+	return strings.Fields(scopeValue)
+}
+
+func decodeJWTPayload(jwt string) map[string]any {
+	parts := strings.Split(jwt, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return ""
+		return nil
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(decoded, &payload); err != nil {
-		return ""
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil
 	}
-	authClaim, ok := payload[openAICodexJWTClaimPath]
-	if !ok {
-		return ""
-	}
-	authMap, ok := authClaim.(map[string]any)
-	if !ok {
-		return ""
-	}
-	accountID, _ := authMap["chatgpt_account_id"].(string)
-	return strings.TrimSpace(accountID)
+	return claims
 }

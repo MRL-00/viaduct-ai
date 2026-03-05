@@ -3,6 +3,7 @@ package slack
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -15,8 +16,10 @@ import (
 )
 
 type Connector struct {
-	botToken string
-	appToken string
+	botToken  string
+	appToken  string
+	botUserID string
+	botID     string
 
 	client       *slackapi.Client
 	socketClient *socketmode.Client
@@ -237,6 +240,21 @@ func (c *Connector) Listen(ctx context.Context, handler connector.MessageHandler
 		return fmt.Errorf("slack.app_token is required for socket mode listener")
 	}
 
+	auth, err := c.client.AuthTestContext(ctx)
+	if err != nil {
+		return fmt.Errorf("slack auth test failed before starting socket mode: %w", err)
+	}
+	log.Printf(
+		"slack auth ok: team=%s team_id=%s user=%s user_id=%s bot_id=%s",
+		auth.Team,
+		auth.TeamID,
+		auth.User,
+		auth.UserID,
+		auth.BotID,
+	)
+	c.botUserID = auth.UserID
+	c.botID = auth.BotID
+
 	go c.socketClient.RunContext(ctx)
 
 	for {
@@ -244,16 +262,32 @@ func (c *Connector) Listen(ctx context.Context, handler connector.MessageHandler
 		case <-ctx.Done():
 			return ctx.Err()
 		case event := <-c.socketClient.Events:
+			log.Printf("slack socket mode event received: type=%s", event.Type)
 			switch event.Type {
+			case socketmode.EventTypeConnecting:
+				log.Printf("slack socket mode connecting")
+			case socketmode.EventTypeConnected:
+				log.Printf("slack socket mode connected")
+			case socketmode.EventTypeHello:
+				log.Printf("slack socket mode hello received")
+			case socketmode.EventTypeConnectionError:
+				log.Printf("slack socket mode connection error: %+v", event.Data)
+			case socketmode.EventTypeInvalidAuth:
+				return fmt.Errorf("slack socket mode invalid auth: check slack.app_token and Socket Mode settings")
+			case socketmode.EventTypeDisconnect:
+				log.Printf("slack socket mode disconnected")
 			case socketmode.EventTypeEventsAPI:
 				eventData, ok := event.Data.(slackevents.EventsAPIEvent)
 				if !ok {
+					log.Printf("slack events_api payload had unexpected type: %T", event.Data)
 					continue
 				}
 				c.socketClient.Ack(*event.Request)
+				log.Printf("slack events_api envelope received: type=%s inner=%T", eventData.Type, eventData.InnerEvent.Data)
 				if eventData.Type == slackevents.CallbackEvent {
 					switch inner := eventData.InnerEvent.Data.(type) {
 					case *slackevents.AppMentionEvent:
+						log.Printf("slack app mention received: channel=%s user=%s thread=%s", inner.Channel, inner.User, firstNonEmpty(inner.ThreadTimeStamp, inner.TimeStamp))
 						msg := connector.Message{
 							ID:       inner.TimeStamp,
 							Channel:  inner.Channel,
@@ -266,14 +300,52 @@ func (c *Connector) Listen(ctx context.Context, handler connector.MessageHandler
 						if err := handler(ctx, msg); err != nil {
 							return err
 						}
+					case *slackevents.MessageEvent:
+						if c.shouldHandleDirectMessage(inner) {
+							log.Printf("slack direct message received: channel=%s user=%s thread=%s", inner.Channel, inner.User, inner.ThreadTimeStamp)
+							msg := connector.Message{
+								ID:       inner.TimeStamp,
+								Channel:  inner.Channel,
+								ThreadID: inner.ThreadTimeStamp,
+								User:     inner.User,
+								Content:  inner.Text,
+								Metadata: map[string]any{"source": "direct_message"},
+							}
+							c.rememberThread(msg.ThreadID, msg.ID)
+							if err := handler(ctx, msg); err != nil {
+								return err
+							}
+							continue
+						}
+						if !c.shouldHandleThreadReply(inner) {
+							log.Printf("slack thread message ignored: channel=%s user=%s subtype=%s thread=%s", inner.Channel, inner.User, inner.SubType, inner.ThreadTimeStamp)
+							continue
+						}
+						log.Printf("slack thread reply received: channel=%s user=%s thread=%s", inner.Channel, inner.User, inner.ThreadTimeStamp)
+						msg := connector.Message{
+							ID:       inner.TimeStamp,
+							Channel:  inner.Channel,
+							ThreadID: inner.ThreadTimeStamp,
+							User:     inner.User,
+							Content:  inner.Text,
+							Metadata: map[string]any{"source": "thread_reply"},
+						}
+						c.rememberThread(msg.ThreadID, msg.ID)
+						if err := handler(ctx, msg); err != nil {
+							return err
+						}
+					default:
+						log.Printf("slack callback event ignored: inner=%T", inner)
 					}
 				}
 			case socketmode.EventTypeSlashCommand:
 				cmd, ok := event.Data.(slackapi.SlashCommand)
 				if !ok {
+					log.Printf("slack slash command payload had unexpected type: %T", event.Data)
 					continue
 				}
 				c.socketClient.Ack(*event.Request)
+				log.Printf("slack slash command received: command=%s channel=%s user=%s", cmd.Command, cmd.ChannelID, cmd.UserID)
 				msg := connector.Message{
 					ID:       fmt.Sprintf("%s-%d", cmd.Command, time.Now().UnixNano()),
 					Channel:  cmd.ChannelID,
@@ -364,6 +436,60 @@ func (c *Connector) rememberThread(threadID, messageID string) {
 	if len(c.threadContext[threadID]) > 50 {
 		c.threadContext[threadID] = c.threadContext[threadID][len(c.threadContext[threadID])-50:]
 	}
+}
+
+func (c *Connector) knowsThread(threadID string) bool {
+	if strings.TrimSpace(threadID) == "" {
+		return false
+	}
+	c.threadMu.Lock()
+	defer c.threadMu.Unlock()
+	_, ok := c.threadContext[threadID]
+	return ok
+}
+
+func (c *Connector) shouldHandleThreadReply(event *slackevents.MessageEvent) bool {
+	if event == nil {
+		return false
+	}
+	if event.ChannelType == "im" {
+		return false
+	}
+	if strings.TrimSpace(event.ThreadTimeStamp) == "" {
+		return false
+	}
+	if !c.knowsThread(event.ThreadTimeStamp) {
+		return false
+	}
+	if event.SubType != "" {
+		return false
+	}
+	if event.BotID != "" {
+		return false
+	}
+	if c.botUserID != "" && event.User == c.botUserID {
+		return false
+	}
+	return strings.TrimSpace(event.Text) != ""
+}
+
+func (c *Connector) shouldHandleDirectMessage(event *slackevents.MessageEvent) bool {
+	if event == nil {
+		return false
+	}
+	if event.ChannelType != "im" {
+		return false
+	}
+	if event.SubType != "" {
+		return false
+	}
+	if event.BotID != "" {
+		return false
+	}
+	if c.botUserID != "" && event.User == c.botUserID {
+		return false
+	}
+	return strings.TrimSpace(event.Text) != ""
 }
 
 func (c *Connector) getChannels(ctx context.Context, limit int) ([]slackapi.Channel, error) {

@@ -2,9 +2,8 @@
 bin/
 dist/
 tmp/
-docs/
-
-viaduct
+/docs
+/viaduct
 *.db
 *.sqlite
 *.sqlite3

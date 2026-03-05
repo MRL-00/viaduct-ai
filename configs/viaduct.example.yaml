@@ -16,6 +16,15 @@ llm:
       api_key: ${OPENAI_API_KEY}
       default_model: gpt-4o
       base_url: ""
+      # OAuth alternative (OpenAI Codex/ChatGPT sign-in):
+      # auth_type: oauth
+      # oauth:
+      #   mode: authorization_code
+      #   token_url: https://auth.openai.com/oauth/token
+      #   client_id: app_EMoamEEZ73f0CkXaXp7hrann
+      #   refresh_token: ${VIADUCT_OPENAI_REFRESH_TOKEN}
+      #   access_token: ${VIADUCT_OPENAI_ACCESS_TOKEN}
+      #   expires_at: 0
     # OpenAI-compatible custom gateway with OAuth client-credentials auth only.
     custom:
       auth_type: oauth

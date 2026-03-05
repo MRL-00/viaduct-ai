@@ -50,9 +50,13 @@ type LLMProvider struct {
 }
 
 type OAuthConfig struct {
+	Mode         string   `mapstructure:"mode"`
 	TokenURL     string   `mapstructure:"token_url"`
 	ClientID     string   `mapstructure:"client_id"`
 	ClientSecret string   `mapstructure:"client_secret"`
+	AccessToken  string   `mapstructure:"access_token"`
+	RefreshToken string   `mapstructure:"refresh_token"`
+	ExpiresAt    int64    `mapstructure:"expires_at"`
 	Scopes       []string `mapstructure:"scopes"`
 }
 
@@ -208,6 +212,13 @@ func (c Config) Validate() error {
 			if provider.APIKey != "" {
 				return fmt.Errorf("llm.providers.%s.api_key is not supported; use oauth only", name)
 			}
+			mode := strings.ToLower(strings.TrimSpace(provider.OAuth.Mode))
+			if mode == "" {
+				mode = "client_credentials"
+			}
+			if mode != "client_credentials" {
+				return fmt.Errorf("llm.providers.%s.oauth.mode must be client_credentials", name)
+			}
 			if provider.OAuth.TokenURL == "" {
 				return fmt.Errorf("llm.providers.%s.oauth.token_url is required", name)
 			}
@@ -216,6 +227,48 @@ func (c Config) Validate() error {
 			}
 			if provider.OAuth.ClientSecret == "" {
 				return fmt.Errorf("llm.providers.%s.oauth.client_secret is required", name)
+			}
+		case "openai":
+			if strings.ToLower(provider.AuthType) == "oauth" {
+				mode := strings.ToLower(strings.TrimSpace(provider.OAuth.Mode))
+				if mode == "" {
+					if provider.OAuth.RefreshToken != "" || provider.OAuth.AccessToken != "" {
+						mode = "authorization_code"
+					} else {
+						mode = "client_credentials"
+					}
+				}
+				if provider.APIKey != "" {
+					return fmt.Errorf("llm.providers.%s.api_key should be empty when auth_type=oauth", name)
+				}
+				switch mode {
+				case "authorization_code":
+					if provider.OAuth.TokenURL == "" {
+						return fmt.Errorf("llm.providers.%s.oauth.token_url is required", name)
+					}
+					if provider.OAuth.ClientID == "" {
+						return fmt.Errorf("llm.providers.%s.oauth.client_id is required", name)
+					}
+					if provider.OAuth.RefreshToken == "" {
+						return fmt.Errorf("llm.providers.%s.oauth.refresh_token is required when oauth.mode=authorization_code", name)
+					}
+				case "client_credentials":
+					if provider.OAuth.TokenURL == "" {
+						return fmt.Errorf("llm.providers.%s.oauth.token_url is required", name)
+					}
+					if provider.OAuth.ClientID == "" {
+						return fmt.Errorf("llm.providers.%s.oauth.client_id is required", name)
+					}
+					if provider.OAuth.ClientSecret == "" {
+						return fmt.Errorf("llm.providers.%s.oauth.client_secret is required", name)
+					}
+				default:
+					return fmt.Errorf("llm.providers.%s.oauth.mode must be client_credentials or authorization_code", name)
+				}
+				break
+			}
+			if provider.APIKey == "" {
+				return fmt.Errorf("llm.providers.%s.api_key is required", name)
 			}
 		default:
 			if provider.APIKey == "" {

@@ -11,6 +11,7 @@ This repository implements a Phase 1 foundation:
 - Connectors: Microsoft 365 (read), Azure (read), Slack (read/write/listen)
 - LLM router + Anthropic/OpenAI providers
 - Agent orchestration loop with tool calls
+- Inbound chat bridge for messenger connectors (Slack app mentions and slash commands)
 - CRON scheduler (`robfig/cron/v3`)
 - Audit + LLM usage logging
 - Cobra CLI
@@ -53,10 +54,17 @@ Or directly:
 go run ./cmd/viaduct --config ./viaduct.yaml
 ```
 
+If `viaduct.yaml` is missing, Viaduct automatically starts first-run onboarding and creates it.
+Onboarding uses interactive selector menus (arrow keys/enter when terminal supports it) and defaults to OAuth.
+Default onboarding is a quick enterprise OAuth flow with minimal prompts.
+Onboarding now includes optional Slack connector setup, including default channel.
+If config already exists but Slack setup is missing or incomplete (for example missing bot token), `viaduct serve` prompts to complete Slack onboarding.
+Slack setup prompts for default channel plus optional bot/app tokens.
+
 4. Health check:
 
 ```bash
-curl -s http://127.0.0.1:8080/healthz
+curl -s http://127.0.0.1:8080/health
 ```
 
 ## Local Testing
@@ -77,13 +85,18 @@ viaduct jobs history morning-briefing --last 10 --config ./viaduct.yaml
 
 # Ad-hoc task
 viaduct task run "Summarise active Azure alerts and draft a Slack update" --config ./viaduct.yaml
+
+# Setup/onboarding
+viaduct setup init --config ./viaduct.yaml
+viaduct setup init --advanced --config ./viaduct.yaml
+viaduct setup slack --config ./viaduct.yaml
 ```
 
 ## Model Setup
 
 Viaduct currently supports:
 - `anthropic` (API key)
-- `openai` (API key)
+- `openai` (API key or OpenAI OAuth authorization-code flow)
 - `custom` (OpenAI-compatible endpoint with OAuth client-credentials only)
 
 ### OAuth-only custom model provider
@@ -108,7 +121,13 @@ llm:
 
 Notes:
 - `custom` provider rejects API key auth by design.
-- OAuth flow is client credentials (`grant_type=client_credentials`).
+- `custom` OAuth flow is client credentials (`grant_type=client_credentials`).
+- OpenAI quick onboarding now follows OpenClaw-style PKCE OAuth:
+  - callback listener on `http://127.0.0.1:1455/auth/callback`
+  - browser URL uses OpenAI Codex OAuth parameters (`code_challenge`, `state`, `originator`, etc.)
+  - automatic browser open + code exchange at `https://auth.openai.com/oauth/token`
+- Quick onboarding auto-selects a recommended OpenAI/Codex default model (no model prompt). Use `viaduct setup init --advanced` to choose manually.
+- During onboarding, Anthropic setup can run `claude setup-token` if the `claude` CLI is installed.
 
 ## Model CLI
 

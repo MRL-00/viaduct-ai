@@ -14,9 +14,13 @@ import (
 )
 
 type OAuthClientCredentialsConfig struct {
+	Mode         string
 	TokenURL     string
 	ClientID     string
 	ClientSecret string
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    int64
 	Scopes       []string
 }
 
@@ -26,6 +30,11 @@ func NewOpenAICompatibleOAuthProvider(name, defaultModel, baseURL string, oauthC
 		cfg.BaseURL = strings.TrimRight(baseURL, "/")
 	}
 	tokenSource := &oauthTokenSource{httpClient: &http.Client{Timeout: 30 * time.Second}, cfg: oauthCfg}
+	tokenSource.token = strings.TrimSpace(oauthCfg.AccessToken)
+	tokenSource.refreshToken = strings.TrimSpace(oauthCfg.RefreshToken)
+	if oauthCfg.ExpiresAt > 0 {
+		tokenSource.expiresAt = time.Unix(oauthCfg.ExpiresAt, 0)
+	}
 	cfg.HTTPClient = &http.Client{
 		Timeout: 60 * time.Second,
 		Transport: &oauthTransport{
@@ -60,9 +69,10 @@ type oauthTokenSource struct {
 	httpClient *http.Client
 	cfg        OAuthClientCredentialsConfig
 
-	mu        sync.Mutex
-	token     string
-	expiresAt time.Time
+	mu           sync.Mutex
+	token        string
+	refreshToken string
+	expiresAt    time.Time
 }
 
 func (s *oauthTokenSource) Token(ctx context.Context) (string, error) {
@@ -73,6 +83,24 @@ func (s *oauthTokenSource) Token(ctx context.Context) (string, error) {
 		return s.token, nil
 	}
 
+	mode := strings.ToLower(strings.TrimSpace(s.cfg.Mode))
+	if mode == "" {
+		if s.refreshToken != "" {
+			mode = "authorization_code"
+		} else {
+			mode = "client_credentials"
+		}
+	}
+
+	switch mode {
+	case "authorization_code":
+		return s.refreshWithRefreshToken(ctx)
+	default:
+		return s.refreshWithClientCredentials(ctx)
+	}
+}
+
+func (s *oauthTokenSource) refreshWithClientCredentials(ctx context.Context) (string, error) {
 	form := url.Values{}
 	form.Set("grant_type", "client_credentials")
 	form.Set("client_id", s.cfg.ClientID)
@@ -106,6 +134,60 @@ func (s *oauthTokenSource) Token(ctx context.Context) (string, error) {
 	}
 	if payload.AccessToken == "" {
 		return "", fmt.Errorf("oauth token response missing access_token")
+	}
+
+	s.token = payload.AccessToken
+	if payload.ExpiresIn <= 0 {
+		payload.ExpiresIn = 300
+	}
+	s.expiresAt = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
+	return s.token, nil
+}
+
+func (s *oauthTokenSource) refreshWithRefreshToken(ctx context.Context) (string, error) {
+	if s.cfg.TokenURL == "" {
+		return "", fmt.Errorf("oauth token_url is required")
+	}
+	if s.cfg.ClientID == "" {
+		return "", fmt.Errorf("oauth client_id is required")
+	}
+	if strings.TrimSpace(s.refreshToken) == "" {
+		return "", fmt.Errorf("oauth refresh_token is required")
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", s.refreshToken)
+	form.Set("client_id", s.cfg.ClientID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.TokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("build oauth refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request oauth refresh token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var payload struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode oauth refresh response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("oauth refresh request failed (%d)", resp.StatusCode)
+	}
+	if payload.AccessToken == "" {
+		return "", fmt.Errorf("oauth refresh response missing access_token")
+	}
+	if payload.RefreshToken != "" {
+		s.refreshToken = payload.RefreshToken
 	}
 
 	s.token = payload.AccessToken
